@@ -1,271 +1,217 @@
-#include <Servo.h>
-#include<Wire.h>
-#include<SoftwareSerial.h> 
+/* Copyright (C) 2012 Kristian Lauszus, TKJ Electronics. All rights reserved.
 
+ This software may be distributed and modified under the terms of the GNU
+ General Public License version 2 (GPL2) as published by the Free Software
+ Foundation and appearing in the file GPL2.TXT included in the packaging of
+ this file. Please note that GPL2 Section 2[b] requires that all works based
+ on this software must also be made publicly available under the terms of
+ the GPL2 ("Copyleft").
 
-SoftwareSerial mySerial(0, 1); // RX, TX
+ Contact information
+ -------------------
 
-Servo ESC_1; // front left
-Servo ESC_2; //front right
-Servo ESC_3; // back left
-Servo ESC_4; //back right
+ Kristian Lauszus, TKJ Electronics
+ Web      :  http://www.tkjelectronics.com
+ e-mail   :  kristianl@tkjelectronics.com
+ */
 
+#include <Wire.h>
+#include <Kalman.h> // Source: https://github.com/TKJElectronics/KalmanFilter
 
-int16_t Acc_rawX, Acc_rawY, Acc_rawZ,Gyr_rawX, Gyr_rawY, Gyr_rawZ;
- 
+#define RESTRICT_PITCH // Comment out to restrict roll to ±90deg instead - please read: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf
 
-float Acceleration_angle[2];
-float Gyro_angle[2];
-float Total_angle[2];
+Kalman kalmanX; // Create the Kalman instances
+Kalman kalmanY;
 
+/* IMU Data */
+double accX, accY, accZ;
+double gyroX, gyroY, gyroZ;
+int16_t tempRaw;
+double pitchS=0.0,rollS=0.0,pitchA=0.0,rollA=0.0;
+int i=0,j=0;
 
+double gyroXangle, gyroYangle; // Angle calculate using the gyro only
+double compAngleX, compAngleY; // Calculated angle using a complementary filter
+double kalAngleX, kalAngleY; // Calculated angle using a Kalman filter
 
+uint32_t timer;
+uint8_t i2cData[14]; // Buffer for I2C data
 
-float elapsedTime_r, time_r, timePrev_r;
-float elapsedTime_p, time_p, timePrev_p;
-int i;
-float rad_to_deg = 180/3.141592654;
-
-float PID_r, previous_error_r;
-float pid_p_r=0;
-float pid_i_r=0;
-float pid_d_r=0;
-
-float esc_f_l,esc_f_r,esc_b_l,esc_b_r;
-
-float PID_p, error_p, previous_error_p;
-float pid_p_p=0;
-float pid_i_p=0;
-float pid_d_p=0;
-
-
-
-/////////////////PID CONSTANTS/////////////////
-double kp_r=3.55;//3.55
-double ki_r=0.05;//0.003
-double kd_r=1.05;//2.05
-
-double kp_p=3;//3.55
-double ki_p=0.05;//0.003
-double kd_p=1.05;//2.05
-///////////////////////////////////////////////
-
-double throttle=1000; //initial value of throttle to the motors
-float desired_angle = 0; //This is the angle in which we whant the
-                         //balance to stay steady
-
-double total_error_r,last_error_r,total_error_p,last_error_p;
-
-
-
-
+// TODO: Make calibration routine
 
 void setup() {
-  // put your setup code here, to run once:
+  Serial.begin(115200);
+  Wire.begin();
+#if ARDUINO >= 157
+  Wire.setClock(400000UL); // Set I2C frequency to 400kHz
+#else
+  TWBR = ((F_CPU / 400000UL) - 16) / 2; // Set I2C frequency to 400kHz
+#endif
 
-    Wire.begin(); //begin the wire comunication
-  Wire.beginTransmission(0x68);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission(true);
-  Serial.begin(250000);
-  mySerial.begin(9600);
-  ESC_1.attach(5,1000,2000); 
-   ESC_2.attach(6,1000,2000);
-  ESC_3.attach(9,1000,2000);
-  ESC_4.attach(10,1000,2000);// (pin, min pulse width, max pulse width in milliseconds) 
+  i2cData[0] = 7; // Set the sample rate to 1000Hz - 8kHz/(7+1) = 1000Hz
+  i2cData[1] = 0x00; // Disable FSYNC and set 260 Hz Acc filtering, 256 Hz Gyro filtering, 8 KHz sampling
+  i2cData[2] = 0x00; // Set Gyro Full Scale Range to ±250deg/s
+  i2cData[3] = 0x00; // Set Accelerometer Full Scale Range to ±2g
+  while (i2cWrite(0x19, i2cData, 4, false)); // Write to all four registers at once
+  while (i2cWrite(0x6B, 0x01, true)); // PLL with X axis gyroscope reference and disable sleep mode
 
-  time_r = millis(); //Start counting time in milliseconds
-  time_p = millis();
-  ESC_1.writeMicroseconds(1000); 
-  ESC_2.writeMicroseconds(1000);
-  ESC_3.writeMicroseconds(1000); 
-  ESC_4.writeMicroseconds(1000);
-  delay(2000);
+  while (i2cRead(0x75, i2cData, 1));
+  if (i2cData[0] != 0x68) { // Read "WHO_AM_I" register
+    Serial.print(F("Error reading sensor"));
+    while (1);
+  }
 
+  delay(100); // Wait for sensor to stabilize
+
+  /* Set kalman and gyro starting angle */
+  while (i2cRead(0x3B, i2cData, 6));
+  accX = (int16_t)((i2cData[0] << 8) | i2cData[1]);
+  accY = (int16_t)((i2cData[2] << 8) | i2cData[3]);
+  accZ = (int16_t)((i2cData[4] << 8) | i2cData[5]);
+
+  // Source: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf eq. 25 and eq. 26
+  // atan2 outputs the value of -π to π (radians) - see http://en.wikipedia.org/wiki/Atan2
+  // It is then converted from radians to degrees
+#ifdef RESTRICT_PITCH // Eq. 25 and 26
+  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
+#else // Eq. 28 and 29
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+#endif
+
+  kalmanX.setAngle(roll); // Set starting angle
+  kalmanY.setAngle(pitch);
+  gyroXangle = roll;
+  gyroYangle = pitch;
+  compAngleX = roll;
+  compAngleY = pitch;
+
+  timer = micros();
 }
 
-char z;
-
 void loop() {
-  // put your main code here, to run repeatedly:
+  /* Update all the values */
+  while (i2cRead(0x3B, i2cData, 14));
+  accX = (int16_t)((i2cData[0] << 8) | i2cData[1]);
+  accY = (int16_t)((i2cData[2] << 8) | i2cData[3]);
+  accZ = (int16_t)((i2cData[4] << 8) | i2cData[5]);
+  tempRaw = (int16_t)((i2cData[6] << 8) | i2cData[7]);
+  gyroX = (int16_t)((i2cData[8] << 8) | i2cData[9]);
+  gyroY = (int16_t)((i2cData[10] << 8) | i2cData[11]);
+  gyroZ = (int16_t)((i2cData[12] << 8) | i2cData[13]);;
 
-  
-     if(mySerial.available() >0 ){
-      delay(100);
-      z = mySerial.read();
-       mySerial.println(z);
-          if(z == 'a'){
-             throttle = throttle + 100;
-          }
-          else if(z == 'b'){
-             throttle = throttle - 100;
-          }
-          if(z == 'c'){
-             throttle = throttle + 50;
-          }
-          else if(z == 'd'){
-             throttle = throttle + 25;
-          }
-          if(z == 'e'){
-             throttle = 1000;
-          }
-     }     
-    timePrev_r = time_r; 
-    time_r = millis();  
-    elapsedTime_r = (time_r - timePrev_r) / 1000;
+  double dt = (double)(micros() - timer) / 1000000; // Calculate delta time
+  timer = micros();
 
-    timePrev_p = time_p;  
-    time_p = millis();  
-    elapsedTime_p = (time_p - timePrev_p) / 1000;
+  // Source: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf eq. 25 and eq. 26
+  // atan2 outputs the value of -π to π (radians) - see http://en.wikipedia.org/wiki/Atan2
+  // It is then converted from radians to degrees
+#ifdef RESTRICT_PITCH // Eq. 25 and 26
 
-    Wire.beginTransmission(0x68);
-     Wire.write(0x3B); //Ask for the 0x3B register- correspond to AcX
-     Wire.endTransmission(false);
-     Wire.requestFrom(0x68,6,true); 
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
+#else // Eq. 28 and 29
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+#endif
 
+  double gyroXrate = gyroX / 131.0; // Convert to deg/s
+  double gyroYrate = gyroY / 131.0; // Convert to deg/s
 
-     Acc_rawX=Wire.read()<<8|Wire.read(); //each value needs two registres
-     Acc_rawY=Wire.read()<<8|Wire.read();
-     Acc_rawZ=Wire.read()<<8|Wire.read();
+#ifdef RESTRICT_PITCH
+  // This fixes the transition problem when the accelerometer angle jumps between -180 and 180 degrees
+  if ((roll < -90 && kalAngleX > 90) || (roll > 90 && kalAngleX < -90)) {
+    kalmanX.setAngle(roll);
+    compAngleX = roll;
+    kalAngleX = roll;
+    gyroXangle = roll;
+  } else
+    kalAngleX = kalmanX.getAngle(roll, gyroXrate, dt); // Calculate the angle using a Kalman filter
 
-    /*---X---*/
-    Acceleration_angle[0] = atan((Acc_rawY/16384.0)/sqrt(pow((Acc_rawX/16384.0),2) + pow((Acc_rawZ/16384.0),2)))*rad_to_deg;
-     /*---Y---*/
-     Acceleration_angle[1] = atan(-1*(Acc_rawX/16384.0)/sqrt(pow((Acc_rawY/16384.0),2) + pow((Acc_rawZ/16384.0),2)))*rad_to_deg;
+  if (abs(kalAngleX) > 90)
+    gyroYrate = -gyroYrate; // Invert rate, so it fits the restriced accelerometer reading
+  kalAngleY = kalmanY.getAngle(pitch, gyroYrate, dt);
+#else
+  // This fixes the transition problem when the accelerometer angle jumps between -180 and 180 degrees
+  if ((pitch < -90 && kalAngleY > 90) || (pitch > 90 && kalAngleY < -90)) {
+    kalmanY.setAngle(pitch);
+    compAngleY = pitch;
+    kalAngleY = pitch;
+    gyroYangle = pitch;
+  } else
+    kalAngleY = kalmanY.getAngle(pitch, gyroYrate, dt); // Calculate the angle using a Kalman filter
 
-    Wire.beginTransmission(0x68);
-     Wire.write(0x43); //Gyro data first adress
-    Wire.endTransmission(false);
-    Wire.requestFrom(0x68,4,true); //Just 4 registers
-   
-     Gyr_rawX=Wire.read()<<8|Wire.read(); //Once again we shif and sum
-    Gyr_rawY=Wire.read()<<8|Wire.read();
+  if (abs(kalAngleY) > 90)
+    gyroXrate = -gyroXrate; // Invert rate, so it fits the restriced accelerometer reading
+  kalAngleX = kalmanX.getAngle(roll, gyroXrate, dt); // Calculate the angle using a Kalman filter
+#endif
 
-    /*---X---*/
-    Gyro_angle[0] = Gyr_rawX/131.0; 
-    /*---Y---*/
-    Gyro_angle[1] = Gyr_rawY/131.0;
+  gyroXangle += gyroXrate * dt; // Calculate gyro angle without any filter
+  gyroYangle += gyroYrate * dt;
+  //gyroXangle += kalmanX.getRate() * dt; // Calculate gyro angle using the unbiased rate
+  //gyroYangle += kalmanY.getRate() * dt;
 
+  compAngleX = 0.93 * (compAngleX + gyroXrate * dt) + 0.07 * roll; // Calculate the angle using a Complimentary filter
+  compAngleY = 0.93 * (compAngleY + gyroYrate * dt) + 0.07 * pitch;
 
-    /*---X axis angle---*/ //pitch angle
-    Total_angle[0] = 0.98 *(Total_angle[0] + Gyro_angle[0]*elapsedTime_p) + 0.02*Acceleration_angle[0];
-    /*---Y axis angle---*///roll angle
-    Total_angle[1] = 0.98 *(Total_angle[1] + Gyro_angle[1]*elapsedTime_r) + 0.02*Acceleration_angle[1];
+  // Reset the gyro angle when it has drifted too much
+  if (gyroXangle < -180 || gyroXangle > 180)
+    gyroXangle = kalAngleX;
+  if (gyroYangle < -180 || gyroYangle > 180)
+    gyroYangle = kalAngleY;
 
+  /* Print Data */
+#if 0 // Set to 1 to activate
+  Serial.print(accX); Serial.print("\t");
+  Serial.print(accY); Serial.print("\t");
+  Serial.print(accZ); Serial.print("\t");
 
-    // new total angle
-   Total_angle[1] = Total_angle[1] + 0.032994;
-   Total_angle[0] = Total_angle[0] + 0.014066;
-   
-     /*Now we have our angles in degree and values from -10º0 to 100º aprox*/
-      Serial.print("Pitch angle = ");
-      Serial.print(Total_angle[0]);
+  Serial.print(gyroX); Serial.print("\t");
+  Serial.print(gyroY); Serial.print("\t");
+  Serial.print(gyroZ); Serial.print("\t");
 
-      Serial.print("roll angle = ");
-      Serial.print(Total_angle[1]);
+  Serial.print("\t");
+#endif
+  kalAngleX = kalAngleX - 0.32;
+  kalAngleY = kalAngleY + 1.61;
+//  Serial.print(roll); Serial.print("\t");
+//  Serial.print(gyroXangle); Serial.print("\t");
+//  Serial.print(compAngleX); 
+  Serial.print("pitch angle = ");
+  Serial.print(kalAngleX); Serial.print("\t");
+//
+  Serial.print("\t");
 
-      Serial.print("  throttle is ");
-     Serial.println(throttle);
-     error_r = Total_angle[1] - desired_angle;
-     error_p = Total_angle[0] - desired_angle;
+//  Serial.print(pitch); Serial.print("\t");
+ // Serial.print(gyroYangle); Serial.print("\t");
+//  Serial.print(compAngleY); 
+  Serial.print("\t roll angle = ");
+  Serial.print(kalAngleY); Serial.print("\t");
 
-    
-    if(throttle == 1000)
-    {
-    ESC_1.writeMicroseconds(1000);
-    ESC_3.writeMicroseconds(1000);
-    ESC_4.writeMicroseconds(1000);
-    ESC_2.writeMicroseconds(1000);
-    }
-    else
-    {
+  if(j> 1000)
+  {
+    pitchS += kalAngleX;
+    rollS += kalAngleY;
+    pitchA = pitchS/i;
+    rollA = rollS/i;
 
-    pid_p_r = kp_r*error_r;
-      total_error_r = total_error_r + error_r;
-      pid_i_r = ki_r * elapsedTime_r*total_error_r;
-      pid_d_r = kd_r*((error_r - previous_error_r)/elapsedTime_r);
+    Serial.print("\tpitch average = ");Serial.print(pitchA);Serial.print("\troll Average = ");Serial.print(rollA);Serial.print("\t i is");Serial.println(i);
+    i++;
+  }
+  else{
+    pitchS = 0;
+    rollS = 0;
+    i = 0;
+  }
+j++;
+#if 0 // Set to 1 to print the temperature
+  Serial.print("\t");
 
-      PID_r = pid_p_r + pid_i_r + pid_d_r;
-      if(PID_r < -1000)
-      {
-      PID_r=-1000;
-      }
-      if(PID_r > 1000)
-      {
-        PID_r=1000;
-       }
+  double temperature = (double)tempRaw / 340.0 + 36.53;
+  Serial.print(temperature); Serial.print("\t");
+#endif
 
-        pid_p_p = kp_p*error_p;
-
-        pid_d_p = kd_p*((error_p - previous_error_p)/elapsedTime_p);
-
-        total_error_r = total_error_r + error_r;
-        pid_i_r = ki_r * elapsedTime_r*total_error_r;
-
-        PID_p = pid_p_p + pid_i_p + pid_d_p;
-
-
-        if(PID_p < -1000)
-        {
-           PID_p=-1000;
-        }
-        if(PID_p > 1000)
-        {
-          PID_p=1000;
-        }
-
-        
-      esc_f_l = throttle + PID_r - PID_p;
-      esc_b_l = throttle + PID_r + PID_p;
-      esc_f_r = throttle - PID_r - PID_p;
-      esc_b_r = throttle - PID_r + PID_p;
-
-       if(esc_f_l < 1000)
-        {
-          esc_f_l= 1000;
-        }
-        if(esc_f_l > 2000)
-        {
-          esc_f_l=2000;
-        }
-
-        if(esc_f_r < 1000)
-        {
-          esc_f_r= 1000;
-        }
-        if(esc_f_r > 2000)
-        {
-          esc_f_r=2000;
-        }
-        
-       if(esc_b_l < 1000)
-        {
-          esc_b_l= 1000;
-        }
-        if(esc_b_l > 2000)
-        {
-          esc_b_l=2000;
-        }
-
-        if(esc_b_r < 1000)
-        {
-          esc_b_r= 1000;
-        }
-        if(esc_b_r > 2000)
-        {
-          esc_b_r=2000;
-        }
-        
-        ESC_1.writeMicroseconds(esc_f_l);
-        ESC_2.writeMicroseconds(esc_f_r);
-        ESC_3.writeMicroseconds(esc_b_l);
-        ESC_4.writeMicroseconds(esv_b_r);
-      
-    }   
-    previous_error_p = error_p; 
-    previous_error_r = error_r;      
-}//end of loop void
-  
-
-
+  Serial.print("\r\n");
+  delay(2);
+}
