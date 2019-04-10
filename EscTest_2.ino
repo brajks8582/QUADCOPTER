@@ -1,29 +1,12 @@
-/* Copyright (C) 2012 Kristian Lauszus, TKJ Electronics. All rights reserved.
-
- This software may be distributed and modified under the terms of the GNU
- General Public License version 2 (GPL2) as published by the Free Software
- Foundation and appearing in the file GPL2.TXT included in the packaging of
- this file. Please note that GPL2 Section 2[b] requires that all works based
- on this software must also be made publicly available under the terms of
- the GPL2 ("Copyleft").
-
- Contact information
- -------------------
-
- Kristian Lauszus, TKJ Electronics
- Web      :  http://www.tkjelectronics.com
- e-mail   :  kristianl@tkjelectronics.com
- */
 #include <Servo.h>
 #include<SoftwareSerial.h>
-
 #include <Wire.h>
 #include <Kalman.h> // Source: https://github.com/TKJElectronics/KalmanFilter
 
 #define RESTRICT_PITCH // Comment out to restrict roll to ±90deg instead - please read: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf
 #include <PID_v1.h>
 
- 
+
 SoftwareSerial mySerial(0, 1); // RX, TX
 
 Servo ESC_1; // front left
@@ -50,7 +33,6 @@ double Setpoint_p, Input_p, Output_p;
 //Specify the links and initial tuning parameters
 double Kp_p = 2, Ki_p = 5, Kd_p = 1;
 PID myPID_p(&Input_p, &Output_p, &Setpoint_p, Kp_p, Ki_p, Kd_p, DIRECT);
-
 
 
 Kalman kalmanX; // Create the Kalman instances
@@ -104,11 +86,11 @@ void setup() {
   // atan2 outputs the value of -π to π (radians) - see http://en.wikipedia.org/wiki/Atan2
   // It is then converted from radians to degrees
 #ifdef RESTRICT_PITCH // Eq. 25 and 26
-  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
   double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
 #else // Eq. 28 and 29
   double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
-  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
 #endif
 
   kalmanX.setAngle(roll); // Set starting angle
@@ -117,7 +99,6 @@ void setup() {
   gyroYangle = pitch;
   compAngleX = roll;
   compAngleY = pitch;
-
 
   timer = micros();
   Input_r = kalAngleY;
@@ -142,12 +123,39 @@ void setup() {
   ESC_2.writeMicroseconds(1000);
   ESC_3.writeMicroseconds(1000);
   ESC_4.writeMicroseconds(1000);
-    delay(2000);
-
+  //  delay(2000);
 
 }
-
+char z;
 void loop() {
+  if(Serial.available() > 0 )
+  {
+    z = Serial.read();
+    if(z == 'a'){
+        ESC_1.writeMicroseconds(1000);
+  ESC_2.writeMicroseconds(1000);
+  ESC_3.writeMicroseconds(1000);
+  ESC_4.writeMicroseconds(1000);
+  while(z != 'b'){
+    Serial.println(" press b to continue");
+    z= Serial.read();
+  }
+    }
+    if(z == 'c'){
+      throttle = throttle + 100;
+    }
+    if(z == 'd')
+    {
+      throttle = throttle - 100;
+    }
+    if( z == 'e'){
+      throttle = throttle + 50;
+      
+    }
+    if(z == 'f'){
+      throttle = throttle - 50;
+    }
+  }
   /* Update all the values */
   while (i2cRead(0x3B, i2cData, 14));
   accX = (int16_t)((i2cData[0] << 8) | i2cData[1]);
@@ -165,11 +173,11 @@ void loop() {
   // atan2 outputs the value of -π to π (radians) - see http://en.wikipedia.org/wiki/Atan2
   // It is then converted from radians to degrees
 #ifdef RESTRICT_PITCH // Eq. 25 and 26
-  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
   double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
 #else // Eq. 28 and 29
   double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
-  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
 #endif
 
   double gyroXrate = gyroX / 131.0; // Convert to deg/s
@@ -217,5 +225,30 @@ void loop() {
   if (gyroYangle < -180 || gyroYangle > 180)
     gyroYangle = kalAngleY;
 
+  kalAngleX = kalAngleX - 0.09;
+  kalAngleY = kalAngleY + 2.35;
+  Serial.print("\tpitch = ");
+  Serial.print(kalAngleX); 
+  Serial.print("\troll = ");
+  Serial.print(kalAngleY); 
+  Input_r = kalAngleY;
+  myPID_r.Compute();
 
-}
+
+  Input_p = kalAngleX;
+  myPID_p.Compute();
+
+  esc_f_l = throttle + Output_r + Output_p;
+  esc_b_l = throttle + Output_r - Output_p;
+  esc_f_r = throttle - Output_r + Output_p;
+  esc_b_r = throttle - Output_r - Output_p;
+
+  
+    Serial.print("\tfront left = "); Serial.print(esc_f_l); Serial.print("\tfront right = "); Serial.print(esc_f_r); Serial.print("\tback left = "); Serial.print(esc_b_l); Serial.print("\tback right = "); Serial.print(esc_b_r);
+     Serial.print("\t pitch gain = "); Serial.print(Output_p); Serial.print("\troll gain = "); Serial.println(Output_r);
+    ESC_1.writeMicroseconds(esc_f_l);
+    ESC_2.writeMicroseconds(esc_f_r);
+    ESC_3.writeMicroseconds(esc_b_l);
+    ESC_4.writeMicroseconds(esc_b_r);
+
+  }
