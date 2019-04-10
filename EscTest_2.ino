@@ -14,11 +14,44 @@
  Web      :  http://www.tkjelectronics.com
  e-mail   :  kristianl@tkjelectronics.com
  */
+#include <Servo.h>
+#include<SoftwareSerial.h>
 
 #include <Wire.h>
 #include <Kalman.h> // Source: https://github.com/TKJElectronics/KalmanFilter
 
 #define RESTRICT_PITCH // Comment out to restrict roll to ±90deg instead - please read: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf
+#include <PID_v1.h>
+
+ 
+SoftwareSerial mySerial(0, 1); // RX, TX
+
+Servo ESC_1; // front left
+Servo ESC_2; //front right
+Servo ESC_3; // back left
+Servo ESC_4; //back right
+
+
+float esc_f_l, esc_f_r, esc_b_l, esc_b_r;
+
+
+double throttle = 1000; //initial value of throttle to the motors
+
+
+//Define Variables we'll be connecting to
+double Setpoint_r, Input_r, Output_r;
+
+//Specify the links and initial tuning parameters
+double Kp_r = 2, Ki_r = 5, Kd_r = 1;
+PID myPID_r(&Input_r, &Output_r, &Setpoint_r, Kp_r, Ki_r, Kd_r, DIRECT);
+
+double Setpoint_p, Input_p, Output_p;
+
+//Specify the links and initial tuning parameters
+double Kp_p = 2, Ki_p = 5, Kd_p = 1;
+PID myPID_p(&Input_p, &Output_p, &Setpoint_p, Kp_p, Ki_p, Kd_p, DIRECT);
+
+
 
 Kalman kalmanX; // Create the Kalman instances
 Kalman kalmanY;
@@ -27,8 +60,6 @@ Kalman kalmanY;
 double accX, accY, accZ;
 double gyroX, gyroY, gyroZ;
 int16_t tempRaw;
-double pitchS=0.0,rollS=0.0,pitchA=0.0,rollA=0.0;
-int i=0,j=0;
 
 double gyroXangle, gyroYangle; // Angle calculate using the gyro only
 double compAngleX, compAngleY; // Calculated angle using a complementary filter
@@ -87,7 +118,33 @@ void setup() {
   compAngleX = roll;
   compAngleY = pitch;
 
+
   timer = micros();
+  Input_r = kalAngleY;
+  Setpoint_r = 0;
+
+  Input_p = kalAngleX;
+  Setpoint_p = 0;
+
+  //turn the PID on
+  myPID_r.SetMode(AUTOMATIC);
+
+  //turn the PID on
+  myPID_p.SetMode(AUTOMATIC);
+
+  mySerial.begin(9600);
+  ESC_1.attach(3, 1000, 2000);
+  ESC_2.attach(6, 1000, 2000);
+  ESC_3.attach(9, 1000, 2000);
+  ESC_4.attach(10, 1000, 2000); // (pin, min pulse width, max pulse width in milliseconds)
+
+  ESC_1.writeMicroseconds(1000);
+  ESC_2.writeMicroseconds(1000);
+  ESC_3.writeMicroseconds(1000);
+  ESC_4.writeMicroseconds(1000);
+    delay(2000);
+
+
 }
 
 void loop() {
@@ -108,8 +165,7 @@ void loop() {
   // atan2 outputs the value of -π to π (radians) - see http://en.wikipedia.org/wiki/Atan2
   // It is then converted from radians to degrees
 #ifdef RESTRICT_PITCH // Eq. 25 and 26
-
-  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
   double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
 #else // Eq. 28 and 29
   double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
@@ -161,57 +217,5 @@ void loop() {
   if (gyroYangle < -180 || gyroYangle > 180)
     gyroYangle = kalAngleY;
 
-  /* Print Data */
-#if 0 // Set to 1 to activate
-  Serial.print(accX); Serial.print("\t");
-  Serial.print(accY); Serial.print("\t");
-  Serial.print(accZ); Serial.print("\t");
 
-  Serial.print(gyroX); Serial.print("\t");
-  Serial.print(gyroY); Serial.print("\t");
-  Serial.print(gyroZ); Serial.print("\t");
-
-  Serial.print("\t");
-#endif
-  kalAngleX = kalAngleX - 0.32;
-  kalAngleY = kalAngleY + 1.61;
-//  Serial.print(roll); Serial.print("\t");
-//  Serial.print(gyroXangle); Serial.print("\t");
-//  Serial.print(compAngleX); 
-  Serial.print("pitch angle = ");
-  Serial.print(kalAngleX); Serial.print("\t");
-//
-  Serial.print("\t");
-
-//  Serial.print(pitch); Serial.print("\t");
- // Serial.print(gyroYangle); Serial.print("\t");
-//  Serial.print(compAngleY); 
-  Serial.print("\t roll angle = ");
-  Serial.print(kalAngleY); Serial.print("\t");
-
-  if(j> 1000)
-  {
-    pitchS += kalAngleX;
-    rollS += kalAngleY;
-    pitchA = pitchS/i;
-    rollA = rollS/i;
-
-    Serial.print("\tpitch average = ");Serial.print(pitchA);Serial.print("\troll Average = ");Serial.print(rollA);Serial.print("\t i is");Serial.println(i);
-    i++;
-  }
-  else{
-    pitchS = 0;
-    rollS = 0;
-    i = 0;
-  }
-j++;
-#if 0 // Set to 1 to print the temperature
-  Serial.print("\t");
-
-  double temperature = (double)tempRaw / 340.0 + 36.53;
-  Serial.print(temperature); Serial.print("\t");
-#endif
-
-  Serial.print("\r\n");
-  delay(2);
 }
